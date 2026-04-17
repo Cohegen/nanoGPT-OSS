@@ -180,7 +180,7 @@ class Transformer(nn.Module):
         self.lm_head.weight = self.embed.weight
 
     def _init_weights(self, module):
-        # Use a consistent std for initial weights
+        # we use a consistent std for initial weights
         # The `len(self.blocks)` is essentially `config.num_hidden_layers`
         std = 0.02 / math.sqrt(2 * len(self.blocks))
 
