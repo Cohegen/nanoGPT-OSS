@@ -1,147 +1,199 @@
-#importing required libraries
-import os
 import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
-from torch.nn import nn
 
-import torch 
-import  torch.distributed as dist
 
-@dataclass 
+
+# CONFIG
+
+@dataclass
 class ModelConfig:
-    num_hidden_layers = 6
-    hidden_size = 512
-    num_attention_heads = 6
-    head_dim = 64
+    num_hidden_layers: int = 6
+    hidden_size: int = 384
 
-    intermediate_size = 2048   # 4x hidden
-    vocab_size = 50000
-    dropout = 0.1
-    
-    #attention
-    num_key_value_heads = 8
+    num_attention_heads: int = 6
+    num_key_value_heads: int = 2
+    head_dim: int = 64
 
-    #context
-    max_pos_emb = 512
+    intermediate_size: int = 1536
 
-    #activation 
-    activation = "swiglu"
+    vocab_size: int = 50000
+    max_seq_len: int = 1024
 
-    # disabled MOE
-    num_experts = 1
-    experts_per_token = 1
+    rope_theta: float = 10000.0
+    rope_scaling: float = 4.0
 
-    sliding_window = None
-    initial_context_length = 256 
-
-    #positional encoding
-    use_rope = True 
-    rope_theta = 10000.0
-
-    #norms 
-    norm_type = "rmsnorm"
-    eps = 1e-5
-
-    #intialization 
-    intializer_range = 0.02 
-
-    #training configs
-    batch_size = 32
-    learning_rate = 3e-4
-    weight_decay = 0.1
-
-    betas = (0.9,0.95)
-    grad_clip = 1.0
-
-    warmup_steps = 500
-    max_iters = 100_000
-
-    lr_decay = True 
-    min_lr  = 3e-5
+    eps: float = 1e-5
 
 
 
-class RMSNomm(nn.Module):
-    def __init__(self,num_features:int,eps:float = 1e-5,device:torch.device | None = None):
+# RMSNorm
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
         super().__init__()
-        self.num_features = num_features 
         self.eps = eps
-        self.scale = nn.Parameter(
-            torch.ones(num_features,device=device,dtype=torch.float32)
-        )
+        self.scale = nn.Parameter(torch.ones(dim))
 
-    def forward(self,x:torch.Tensor)->torch.Tensor:
-        ##validating whether there's dim mismatch
-        assert x.shape[-1] == self.num_features 
-        t,dtype = x.float(),x.dtype
-        ##applying RMSNorm
-        t = t*torch.rsqrt(torch.mean(t**2,dim=-1,keepdim=True)+self.eps)
-        return (t*self.scale).to(dtype)
+    def forward(self, x):
+        return self.scale * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-##helper function for rotarary embedding
-def _apply_rotary_emb(x:torch.Tensor,cos:torch.Tensor,sin:torch.Tensor)->torch.Tensor:
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-    x1,x2 = torch.chunk(x,2,dim=-1)
-    o1 = x1*cos -x2 *sin
-    o2 = x2*cos +x1 *sin 
-    return torch.cat((o1,o2),dim=-1)
 
+
+# RoPE (with scaling)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self,head_dim:int,base:int,dtype:torch.dtype,initial_context_length:int=256,scaling_factor:float = 1.0,ntk_alpha:float = 1.0,ntk_beta=32.0,device:torch.device | None =None,)->None:
+    def __init__(self, dim, base=10000, scale=1.0):
         super().__init__()
-        self.head_dim = head_dim 
-        self.base = base 
-        self.dtype = dtype
-        self.initial_context_length = initial_context_length
-        self.scaling_factor = scaling_factor
-        self.ntk_alpha = ntk_alpha
-        self.ntk_beta = ntk_beta 
+        self.dim = dim
+        self.base = base
+        self.scale = scale
 
-    def _compute_concentration_and_inv_freq(self)->torch.Tensor:
-        freq = self.base ** (
-            torch.arange(0,self.head_dim,2,dtype=torch.float,device=self.device)
-            / self.head_dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, x):
+        B, T, H, D = x.shape
+
+        t = torch.arange(T, device=x.device) / self.scale
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
+        cos = freqs.cos()[None, :, None, :]
+        sin = freqs.sin()[None, :, None, :]
+
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        return torch.cat([x1 * cos - x2 * sin,
+                          x2 * cos + x1 * sin], dim=-1)
+
+
+
+# ATTENTION
+
+class Attention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+
+        self.q = nn.Linear(config.hidden_size,
+                           self.num_heads * self.head_dim)
+
+        self.k = nn.Linear(config.hidden_size,
+                           self.num_kv_heads * self.head_dim)
+
+        self.v = nn.Linear(config.hidden_size,
+                           self.num_kv_heads * self.head_dim)
+
+        self.out = nn.Linear(self.num_heads * self.head_dim,
+                             config.hidden_size)
+
+        self.rope = RotaryEmbedding(self.head_dim,
+                                    config.rope_theta,
+                                    config.rope_scaling)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_kv_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_kv_heads, self.head_dim)
+
+        q = self.rope(q)
+        k = self.rope(k)
+
+        repeat = self.num_heads // self.num_kv_heads
+        k = k.repeat_interleave(repeat, dim=2)
+        v = v.repeat_interleave(repeat, dim=2)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.out(out)
+
+
+
+# MLP (SwiGLU)
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.fc1 = nn.Linear(config.hidden_size,
+                             config.intermediate_size * 2)
+        self.fc2 = nn.Linear(config.intermediate_size,
+                             config.hidden_size)
+
+    def forward(self, x):
+        x1, x2 = self.fc1(x).chunk(2, dim=-1)
+        return self.fc2(x1 * F.silu(x2))
+
+
+
+# BLOCK
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.norm1 = RMSNorm(config.hidden_size)
+        self.norm2 = RMSNorm(config.hidden_size)
+
+        self.attn = Attention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + 0.5 * self.attn(self.norm1(x))
+        x = x + 0.5 * self.mlp(self.norm2(x))
+        return x
+
+
+
+# MODEL
+
+class Transformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.embed = nn.Embedding(config.vocab_size,
+                                  config.hidden_size)
+
+        self.blocks = nn.ModuleList(
+            [Block(config) for _ in range(config.num_hidden_layers)]
         )
-        if self.scaling_factor > 1.0:
-            cocentration = (0.1*math.log(self.scaling_factor)+1.0)
 
-            d_half = self.head_dim / 2
+        self.norm = RMSNorm(config.hidden_size)
 
-            #NTK by parts 
-            low = (
-            d_half
-            * math.log(self.initial_context_length/(self.ntk_beta*2*math.pi))
-            / math.log(self.base)
-             )
- 
-            high = (
-            d_half
-            * math.log(self.initial_context_length /(self.ntk_alpha*2*math.pi))
-            / math.log(self.base)
-            )
+        self.lm_head = nn.Linear(config.hidden_size,
+                                 config.vocab_size,
+                                 bias=False)
 
-            assert 0 < low <high < d_half -1 
+        # Apply custom weight initialization first
+        self.apply(self._init_weights)
 
-        
+        # Tie weights after initialization
+        self.lm_head.weight = self.embed.weight
 
-            interpolation = 1.0 /(self.scaling_factor*freq)
-            extrapolation = 1.0 / freq 
+    def _init_weights(self, module):
+        # Use a consistent std for initial weights
+        # The `len(self.blocks)` is essentially `config.num_hidden_layers`
+        std = 0.02 / math.sqrt(2 * len(self.blocks))
 
-            ramp = (
-            torch.arange(d_half,dtype=torch.float32,device=freq.device)-low
-            ) / (high-low)
-            mask = 1 - ramp.clamp(0,1)
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=std)
 
-            inv_freq = interpolation * (1-mask) +extrapolation * mask
-
-       
-        else:
-            concentration = 1.0
-            inv_freq = 1.0 /freq 
-
-        return concentration,inv_freq 
-
-    def _compute_cos_sin(self,num_tokens:int):
-        pass
+    def forward(self, x):
+        x = self.embed(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        return self.lm_head(x)
