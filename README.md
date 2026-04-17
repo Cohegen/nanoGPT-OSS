@@ -101,7 +101,7 @@ This is the core generation loop behind GPT-style text completion.
 - `oss/generate.py`: generation entry script
 - `dataset/input.txt`: training text corpus
 
-## Summary
+## Conclusion
 
 If you study this repository carefully, you will encounter the main ideas behind a modern small-scale LLM implementation:
 - autoregressive language modeling
