@@ -113,4 +113,4 @@ If you study this repository carefully, you will encounter the main ideas behind
 - tied embeddings
 - standard transformer training and sampling routines
 
-It is best viewed as a compact learning project for understanding how contemporary GPT-like models are put together end to end.
+
